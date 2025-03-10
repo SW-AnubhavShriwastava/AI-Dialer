@@ -4,6 +4,7 @@ import os
 import re
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List
+from datetime import datetime
 
 import google.generativeai as genai
 
@@ -114,14 +115,57 @@ class AbstractLLMService(EventEmitter, ABC):
 
     # New helper function to detect and handle tool calls
     async def handle_tool_calls(self, response_text: str, interaction_count: int) -> bool:
-        # First check if this is a "No" response to "anything else"
-        if "no" in response_text.lower() and "anything else" in response_text.lower():
+        # Check for appointment details in the response
+        if "appointment" in response_text.lower():
+            # Extract date and time using regex
+            date_match = re.search(r'(\d{4}-\d{2}-\d{2}|\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*(?:\s+\d{4})?)', response_text)
+            time_match = re.search(r'(\d{1,2}(?::\d{2})?\s*(?:am|pm|AM|PM)|\d{2}:\d{2})', response_text)
+            
+            if date_match or time_match:
+                details = {}
+                if date_match:
+                    # Convert date to standard format
+                    try:
+                        date_str = date_match.group(1)
+                        parsed_date = datetime.strptime(date_str, '%Y-%m-%d')
+                        details['date'] = parsed_date.strftime('%Y-%m-%d')
+                    except ValueError:
+                        try:
+                            # Try alternative format
+                            parsed_date = datetime.strptime(date_str, '%d %B %Y')
+                            details['date'] = parsed_date.strftime('%Y-%m-%d')
+                        except ValueError:
+                            pass
+                
+                if time_match:
+                    # Convert time to standard format
+                    try:
+                        time_str = time_match.group(1)
+                        parsed_time = datetime.strptime(time_str, '%H:%M')
+                        details['time'] = parsed_time.strftime('%H:%M')
+                    except ValueError:
+                        try:
+                            # Try alternative format
+                            parsed_time = datetime.strptime(time_str, '%I:%M %p')
+                            details['time'] = parsed_time.strftime('%H:%M')
+                        except ValueError:
+                            pass
+                
+                if details:
+                    self.context.update_appointment_details(details)
+
+        # Check for negative responses to "anything else"
+        negative_responses = ["no", "nope", "nahi", "not really", "that's all", "nothing else"]
+        if (any(resp in response_text.lower() for resp in negative_responses) and 
+            ("anything else" in response_text.lower() or self.context.asked_anything_else)):
             logger.info("User indicated no more questions, ending call")
+            self.context.last_response_was_no = True
             await self.emit('llmreply', {
                 "partialResponseIndex": None,
                 "partialResponse": "Thank you for your time. Looking forward to meeting you!"
             }, interaction_count)
             await asyncio.sleep(2)  # Give time for the closing message
+            self.context.mark_conversation_end()
             await self.end_call(self.context, {})
             return True
 
@@ -130,6 +174,9 @@ class AbstractLLMService(EventEmitter, ABC):
         matches = re.findall(pattern, response_text)
         
         if not matches:
+            # If asking about anything else, mark it
+            if "anything else" in response_text.lower():
+                self.context.asked_anything_else = True
             return False
 
         for function_name, args_str in matches:
@@ -139,6 +186,11 @@ class AbstractLLMService(EventEmitter, ABC):
                 # Prevent duplicate WhatsApp messages
                 if function_name == "send_whatsapp" and self.context.whatsapp_sent:
                     logger.info("Skipping duplicate WhatsApp message")
+                    await self.emit('llmreply', {
+                        "partialResponseIndex": None,
+                        "partialResponse": "I've already sent you the confirmation message. Is there anything else I can help you with?"
+                    }, interaction_count)
+                    self.context.asked_anything_else = True
                     return True
 
                 # Get tool metadata
@@ -166,18 +218,18 @@ class AbstractLLMService(EventEmitter, ABC):
                                 "partialResponseIndex": None,
                                 "partialResponse": "I've sent you the confirmation. Is there anything else I can assist you with?"
                             }, interaction_count)
+                            self.context.asked_anything_else = True
                         else:
                             error_msg = function_response.get("error", "Unknown error")
                             await self.emit('llmreply', {
                                 "partialResponseIndex": None,
-                                "partialResponse": f"I apologize, but I couldn't send the WhatsApp message. {error_msg} Please make sure to note down the appointment details: "
+                                "partialResponse": f"I apologize, but I couldn't send the WhatsApp message. {error_msg}"
                             }, interaction_count)
                     return True  # Return True to stop further processing
 
                 # Handle end_call specially
                 elif function_name == "end_call":
-                    self.context.conversation_ended = True
-                    self.context.call_ended = True
+                    self.context.mark_conversation_end()
                     return True
 
                 # For other functions, append to context and continue
